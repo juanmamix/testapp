@@ -28,25 +28,25 @@ class CoreTest {
     }
 
     @Test fun correctsTypos() {
-        assertEquals("hola", sug.suggest("hoal", null).autoCorrect)
-        assertEquals("que", sug.suggest("qie", null).autoCorrect)
-        assertEquals("gracias", sug.suggest("grasias", null).autoCorrect)
-        assertEquals("Mañana", sug.suggest("Mañna", null).autoCorrect)
+        assertEquals("hola", sug.suggest("hoal", emptyList()).autoCorrect)
+        assertEquals("que", sug.suggest("qie", emptyList()).autoCorrect)
+        assertEquals("gracias", sug.suggest("grasias", emptyList()).autoCorrect)
+        assertEquals("Mañana", sug.suggest("Mañna", emptyList()).autoCorrect)
     }
 
     @Test fun restoresAccents() {
-        assertEquals("canción", sug.suggest("cancion", null).autoCorrect)
-        assertEquals("después", sug.suggest("despues", null).autoCorrect)
+        assertEquals("canción", sug.suggest("cancion", emptyList()).autoCorrect)
+        assertEquals("después", sug.suggest("despues", emptyList()).autoCorrect)
     }
 
     @Test fun leavesRealWordsAlone() {
-        assertNull(sug.suggest("esta", null).autoCorrect)
-        assertNull(sug.suggest("casa", null).autoCorrect)
-        assertNull(sug.suggest("el", null).autoCorrect)
+        assertNull(sug.suggest("esta", emptyList()).autoCorrect)
+        assertNull(sug.suggest("casa", emptyList()).autoCorrect)
+        assertNull(sug.suggest("el", emptyList()).autoCorrect)
     }
 
     @Test fun completes() {
-        val r = sug.suggest("grac", null)
+        val r = sug.suggest("grac", emptyList())
         assertTrue(r.slots.toString(), r.slots.contains("gracias"))
     }
 
@@ -54,15 +54,52 @@ class CoreTest {
         val m = LanguageModel()
         m.loadBase(sequenceOf("hola\t1000", "holanda\t500"))
         assertTrue(!m.isKnown("holaaa"))
-        m.learn(null, "holaaa"); assertTrue(!m.isKnown("holaaa"))
-        m.learn(null, "holaaa"); assertTrue(m.isKnown("holaaa"))
-        m.learn("hola", "amigo")
-        assertEquals("amigo", m.predictNext("hola", 1)[0])
+        m.learn(emptyList(), "holaaa"); assertTrue(!m.isKnown("holaaa"))
+        m.learn(emptyList(), "holaaa"); assertTrue(m.isKnown("holaaa"))
+        m.learn(listOf("hola"), "amigo")
+        assertEquals("amigo", m.predictNext(listOf("hola"), 1)[0])
         val m2 = LanguageModel()
         m2.loadBase(sequenceOf("hola\t1000"))
-        m2.importUser(m.exportUserWords().lineSequence(), m.exportBigrams().lineSequence())
+        m2.importUser(m.exportUserWords().lineSequence(), m.exportOrder().lineSequence(), m.exportEmoji().lineSequence())
         assertTrue(m2.isKnown("holaaa"))
         assertEquals(m.frequency("holaaa"), m2.frequency("holaaa"))
+        assertEquals("amigo", m2.predictNext(listOf("hola"), 1)[0])
+    }
+
+    @Test fun learnsWordOrderWithTwoWordsOfContext() {
+        val m = LanguageModel()
+        m.loadBase(sequenceOf("de\t1000", "nada\t900", "verdad\t800", "la\t700", "es\t600", "pues\t10"))
+        // "de nada" and "de verdad" both follow "de"; the word before decides
+        repeat(3) { m.learn(listOf("gracias", "de"), "nada") }
+        repeat(3) { m.learn(listOf("es", "de"), "verdad") }
+        m.learn(listOf("es", "de"), "nada")
+        assertEquals("nada", m.predictNext(listOf("gracias", "de"), 1)[0])
+        assertEquals("verdad", m.predictNext(listOf("es", "de"), 1)[0])
+        // sentence starters
+        repeat(2) { m.learn(listOf(TextUtil.SENTENCE_START), "pues") }
+        assertEquals("pues", m.predictNext(listOf(TextUtil.SENTENCE_START), 1)[0])
+    }
+
+    @Test fun learnsEmojiAfterWords() {
+        val m = LanguageModel()
+        m.loadBase(sequenceOf("jaja\t100", "pizza\t100", "noche\t100"))
+        assertEquals("😂", m.emojiFor("jaja")) // built-in default
+        m.learnEmoji(listOf("jaja"), "🤣")
+        assertEquals("🤣", m.emojiFor("jaja")) // the user's habit wins
+        assertNull(m.emojiAfter(listOf("noche")))
+        m.learnEmoji(listOf("buenas", "noche"), "🌙"); m.learnEmoji(listOf("buenas", "noche"), "🌙")
+        assertEquals("🌙", m.emojiAfter(listOf("buenas", "noche")))
+        assertEquals("🌙", Suggester(m).predict(listOf("buenas", "noche"), false).last())
+        assertEquals(listOf("🌙", "🤣"), m.recentEmojis(5))
+        assertTrue(Suggester(m).suggest("pizza", emptyList()).slots.contains("🍕"))
+    }
+
+    @Test fun contextWordsStayInTheSentence() {
+        assertEquals(listOf("muchas", "gracias"), TextUtil.contextWords("Hola. Muchas gracias ", true).map { it.lowercase() })
+        assertEquals(listOf(TextUtil.SENTENCE_START, "hola"), TextUtil.contextWords("Vale. ¿hola ", true))
+        assertEquals(listOf(TextUtil.SENTENCE_START), TextUtil.contextWords("", true))
+        assertEquals(listOf("jaja"), TextUtil.contextWords("que jaja 😂 ", false, 1))
+        assertTrue(TextUtil.isEmoji("😂")); assertTrue(TextUtil.isEmoji("❤️")); assertTrue(!TextUtil.isEmoji("€"))
     }
 
     @Test fun letterDistributionFollowsLanguage() {
@@ -113,10 +150,26 @@ class CoreTest {
 
     @Test fun suggestionsAreFast() {
         val t0 = System.nanoTime()
-        repeat(200) { sug.suggest("necesitamoz", "nosotros") }
+        repeat(200) { sug.suggest("necesitamoz", listOf("nosotros")) }
         val ms = (System.nanoTime() - t0) / 1_000_000.0 / 200
         println("suggest: %.2f ms".format(ms))
-        assertNotNull(sug.suggest("necesitamoz", null).autoCorrect)
+        assertNotNull(sug.suggest("necesitamoz", emptyList()).autoCorrect)
         assertTrue(ms < 20)
+    }
+
+    @Test fun everyRowFillsTheWidth() {
+        for (spec in listOf(Layouts.LETTERS, Layouts.SYMBOLS, Layouts.SYMBOLS2)) for (row in spec.rows) {
+            assertEquals("${spec.name}: ${row.map { it.label }}", 10f, row.sumOf { it.width.toDouble() }.toFloat(), 0.001f)
+        }
+    }
+
+    @Test fun contextShiftsLetterOdds() {
+        val m = LanguageModel()
+        m.loadBase(sequenceOf("noches\t100", "nada\t5000"))
+        val letters = "abcdefghijklmnñopqrstuvwxyz".toList()
+        val plain = m.nextLetterDistribution("n", letters, listOf("buenas"))!!
+        repeat(3) { m.learn(listOf("buenas"), "noches") }
+        val ctx = m.nextLetterDistribution("n", letters, listOf("buenas"))!!
+        assertTrue(ctx['o']!! > plain['o']!! + 0.2f)
     }
 }

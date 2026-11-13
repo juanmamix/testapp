@@ -2,7 +2,7 @@ package com.juanma.teclado.core
 
 import kotlin.math.hypot
 
-enum class KeyType { LETTER, CHAR, SHIFT, DELETE, SPACE, ENTER, TO_SYMBOLS, TO_SYMBOLS2, TO_LETTERS }
+enum class KeyType { LETTER, CHAR, SHIFT, DELETE, SPACE, ENTER, TO_SYMBOLS, TO_SYMBOLS2, TO_LETTERS, EMOJI }
 
 /** One key of a layout. Widths are in "standard key" units; every row sums to 10. */
 class KeySpec(
@@ -37,8 +37,9 @@ object Layouts {
 
     private fun bottomRow(modeKey: KeySpec) = listOf(
         modeKey,
+        KeySpec(KeyType.EMOJI, "☺", width = 1.25f),
         KeySpec(KeyType.CHAR, ",", width = 1f, variants = listOf(";", ":", "-")),
-        KeySpec(KeyType.SPACE, "espacio", " ", width = 5f),
+        KeySpec(KeyType.SPACE, "espacio", " ", width = 4f),
         KeySpec(KeyType.CHAR, ".", width = 1f, variants = listOf("?", "!", "¿", "¡", "…")),
         KeySpec(KeyType.ENTER, "⏎", "\n", width = 1.5f),
     )
@@ -50,7 +51,7 @@ object Layouts {
             letters("asdfghjklñ"),
             listOf(KeySpec(KeyType.SHIFT, "⇧", width = 1.5f)) + letters("zxcvbnm") +
                 KeySpec(KeyType.DELETE, "⌫", width = 1.5f),
-            bottomRow(KeySpec(KeyType.TO_SYMBOLS, "123", width = 1.5f)),
+            bottomRow(KeySpec(KeyType.TO_SYMBOLS, "123", width = 1.25f)),
         ),
     )
 
@@ -61,7 +62,7 @@ object Layouts {
             chars("-/:;()€&@\""),
             listOf(KeySpec(KeyType.TO_SYMBOLS2, "#+=", width = 1.5f)) + chars("_%¿?¡!'") +
                 KeySpec(KeyType.DELETE, "⌫", width = 1.5f),
-            bottomRow(KeySpec(KeyType.TO_LETTERS, "ABC", width = 1.5f)),
+            bottomRow(KeySpec(KeyType.TO_LETTERS, "ABC", width = 1.25f)),
         ),
     )
 
@@ -72,7 +73,7 @@ object Layouts {
             chars("_\\|~<>$£¥•"),
             listOf(KeySpec(KeyType.TO_SYMBOLS, "123", width = 1.5f)) + chars(".,?!'`·") +
                 KeySpec(KeyType.DELETE, "⌫", width = 1.5f),
-            bottomRow(KeySpec(KeyType.TO_LETTERS, "ABC", width = 1.5f)),
+            bottomRow(KeySpec(KeyType.TO_LETTERS, "ABC", width = 1.25f)),
         ),
     )
 }

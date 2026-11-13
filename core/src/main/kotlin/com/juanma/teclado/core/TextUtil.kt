@@ -33,6 +33,45 @@ object TextUtil {
 
     fun capitalize(s: String): String = s.replaceFirstChar { it.uppercaseChar() }
 
+    /** Marker used as "previous word" at the start of a sentence. */
+    const val SENTENCE_START = "<s>"
+
+    /** True for emoji (and other pictographic tokens), false for words and punctuation. */
+    fun isEmoji(s: String): Boolean {
+        if (s.isEmpty()) return false
+        val cp = s.codePointAt(0)
+        return cp >= 0x2190 && !Character.isLetterOrDigit(cp) && cp !in 0x2000..0x206F
+    }
+
+    /**
+     * Up to [n] words before the cursor, in reading order, staying inside the current
+     * sentence. If the sentence (or the text) starts before them, [SENTENCE_START] is
+     * prepended. Emoji and commas are skipped. [complete] = [text] is the whole text
+     * before the cursor (not a truncated window).
+     */
+    fun contextWords(text: CharSequence, complete: Boolean, n: Int = 2): List<String> {
+        val out = ArrayList<String>(n + 1)
+        var i = text.length
+        while (out.size < n) {
+            while (i > 0 && !isWordChar(text[i - 1]) && text[i - 1] !in SENTENCE_END) i--
+            if (i == 0) {
+                if (complete) out.add(SENTENCE_START)
+                break
+            }
+            if (text[i - 1] in SENTENCE_END) {
+                out.add(SENTENCE_START)
+                break
+            }
+            val end = i
+            while (i > 0 && isWordChar(text[i - 1])) i--
+            out.add(text.substring(i, end))
+        }
+        out.reverse()
+        return out
+    }
+
+    private const val SENTENCE_END = ".!?\n…"
+
     /** Last whole word in [text] (ignores trailing spaces), or null. */
     fun lastWord(text: CharSequence?): String? {
         if (text.isNullOrEmpty()) return null

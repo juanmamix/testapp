@@ -17,7 +17,7 @@ class SuggestResult(val typed: String, val slots: List<String>, val autoCorrect:
 
 class Suggester(private val lm: LanguageModel) {
 
-    fun candidates(typed: String, prev: String?, limit: Int = 8): List<Suggestion> {
+    fun candidates(typed: String, context: List<String>, limit: Int = 8): List<Suggestion> {
         val folded = TextUtil.fold(typed)
         if (folded.isEmpty() || !folded.all { it.isLetter() }) return emptyList()
         val lowerTyped = typed.lowercase()
@@ -38,7 +38,7 @@ class Suggester(private val lm: LanguageModel) {
         // Exact matches, accent variants and typo corrections.
         lm.trie.fuzzy(folded, maxCost, KeyProximity::substitutionCost) { e, cost ->
             if (e.freq <= 0) return@fuzzy
-            var score = ln(e.freq.toFloat()) - COST_WEIGHT * cost + bigramBonus(prev, e.word)
+            var score = ln(e.freq.toFloat()) - COST_WEIGHT * cost + contextBonus(context, e.word)
             val kind = if (e.word.lowercase() == lowerTyped) {
                 score += EXACT_BONUS
                 SuggestionKind.TYPED
@@ -51,7 +51,7 @@ class Suggester(private val lm: LanguageModel) {
             for (e in lm.trie.topWords(node, 6, minLength = 1)) {
                 if (e.freq <= 0) continue
                 val extra = TextUtil.fold(e.word).length - folded.length
-                val score = ln(e.freq.toFloat()) - COMPLETION_PENALTY - 0.25f * extra + bigramBonus(prev, e.word)
+                val score = ln(e.freq.toFloat()) - COMPLETION_PENALTY - 0.25f * extra + contextBonus(context, e.word)
                 offer(Suggestion(e.word, score, SuggestionKind.COMPLETION))
             }
         }
@@ -59,9 +59,9 @@ class Suggester(private val lm: LanguageModel) {
         return best.values.sortedByDescending { it.score }.take(limit)
     }
 
-    fun suggest(typed: String, prev: String?, autocorrect: Boolean = true): SuggestResult {
+    fun suggest(typed: String, context: List<String>, autocorrect: Boolean = true): SuggestResult {
         if (typed.isEmpty()) return SuggestResult.EMPTY
-        val cands = candidates(typed, prev)
+        val cands = candidates(typed, context)
         val auto = if (autocorrect) pickAutoCorrection(typed, cands) else null
 
         val others = cands.map { TextUtil.matchCase(it.word, typed) }.filter { it != typed && it != auto }
@@ -74,18 +74,24 @@ class Suggester(private val lm: LanguageModel) {
                 if (!lm.isKnown(typed) && others.isNotEmpty()) listOf(typed, others[0], others.getOrElse(1) { "" }) else it
             }
         }
-        return SuggestResult(typed, slots, auto)
+        // If this word (or the guess) usually gets an emoji, offer it on the right.
+        val emoji = lm.emojiFor(auto ?: typed)
+        return SuggestResult(typed, if (emoji != null) slots.take(2) + emoji else slots, auto)
     }
 
     /** Suggestions for a word that's already written (cursor placed on it). */
-    fun alternativesFor(word: String, prev: String?): List<String> =
-        candidates(word, prev, 10)
+    fun alternativesFor(word: String, context: List<String>): List<String> =
+        candidates(word, context, 10)
             .map { TextUtil.matchCase(it.word, word) }
             .filter { it != word }
             .take(3)
 
-    fun predict(prev: String?, sentenceStart: Boolean): List<String> =
-        lm.predictNext(prev, 3).map { if (sentenceStart) TextUtil.capitalize(it) else it }
+    /** Next-word predictions; the usual emoji after these words takes the last slot. */
+    fun predict(context: List<String>, sentenceStart: Boolean): List<String> {
+        val words = lm.predictNext(context, 3).map { if (sentenceStart) TextUtil.capitalize(it) else it }
+        val emoji = lm.emojiAfter(context) ?: return words
+        return words.take(2) + emoji
+    }
 
     private fun pickAutoCorrection(typed: String, cands: List<Suggestion>): String? {
         if (typed.length < 2 || !typed.all { it.isLetter() }) return null
@@ -102,9 +108,12 @@ class Suggester(private val lm: LanguageModel) {
         return TextUtil.matchCase(top.word, typed)
     }
 
-    private fun bigramBonus(prev: String?, word: String): Float {
-        val c = lm.bigramCount(prev, word)
-        return if (c > 0) 1.2f * ln(1f + c) + 1f else 0f
+    /** Bonus for words this person usually writes after the previous one or two. */
+    private fun contextBonus(context: List<String>, word: String): Float {
+        if (context.isEmpty()) return 0f
+        val (c2, c3) = lm.contextCounts(context, word)
+        if (c2 == 0 && c3 == 0) return 0f
+        return 1.0f * ln(1f + c2) + 1.6f * ln(1f + c3) + 1f
     }
 
     companion object {

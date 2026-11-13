@@ -9,6 +9,8 @@ import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.media.AudioManager
+import android.os.Build
+import android.os.SystemClock
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
@@ -17,6 +19,7 @@ import com.juanma.teclado.core.KeySpec
 import com.juanma.teclado.core.KeyType
 import com.juanma.teclado.core.KeyboardSpec
 import com.juanma.teclado.core.Layouts
+import com.juanma.teclado.core.TextUtil
 import com.juanma.teclado.core.TouchModel
 import kotlin.math.abs
 import kotlin.math.max
@@ -27,14 +30,19 @@ enum class ShiftState { OFF, ON, LOCKED }
  * Draws the suggestion bar + keys and turns touches into key presses. The drawn keys
  * never change size; which key a touch belongs to is decided by [TouchModel] using the
  * letter probabilities in [prior].
+ *
+ * Motion follows Apple's fluid-interface rules: feedback on touch-down with no delay,
+ * springs (no fixed-duration animations) so everything is interruptible, things leave
+ * the way they came, and "remove animations" in system settings is respected.
  */
 @SuppressLint("ViewConstructor")
-class KeyboardView(context: Context, private val listener: Listener) : View(context) {
+class KeyboardView(context: Context, private val listener: Listener) : View(context), EmojiPane.Listener {
 
     interface Listener {
         /** [box] is null when the letter didn't come from a direct tap (e.g. accent popup). */
         fun onLetter(text: String, box: KeyBox?, x: Float, y: Float)
         fun onChar(text: String)
+        fun onEmoji(emoji: String)
         fun onSpace()
         fun onDelete(repeat: Int)
         fun onEnter()
@@ -52,7 +60,13 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
         set(v) { if (field !== v) { field = v; layoutKeys(); invalidate() } }
 
     var shift = ShiftState.OFF
-        set(v) { if (field != v) { field = v; invalidate() } }
+        set(v) {
+            if (field != v) {
+                field = v
+                shiftAnim.animateTo(if (v == ShiftState.OFF) 0f else 1f)
+                invalidate()
+            }
+        }
 
     var enterLabel = "⏎"
         set(v) { if (field != v) { field = v; invalidate() } }
@@ -63,6 +77,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private var quoteSlot = -1
 
     fun setSuggestions(s: List<String>, bold: Int, quote: Int) {
+        if (s == slots && bold == boldSlot && quote == quoteSlot) return
         slots = s; boldSlot = bold; quoteSlot = quote
         invalidate()
     }
@@ -80,16 +95,31 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     var keyHeightDp = 54
         set(v) { if (field != v) { field = v; requestLayout() } }
 
+    /** Shows/hides the emoji panel (slides up from below, leaves the same way). */
+    var emojiVisible = false
+        set(v) {
+            if (field != v) {
+                field = v
+                emojiAnim.animateTo(if (v) 1f else 0f)
+                cancelAllPointers()
+                invalidate()
+            }
+        }
+
+    var recentEmojis: List<String>
+        get() = emojiPane.recents
+        set(v) { emojiPane.recents = v }
+
     // ---------------------------------------------------------------- geometry
 
     private val dp = resources.displayMetrics.density
     private val stripH get() = 44 * dp
     private val keyH get() = keyHeightDp * dp
-    private val topPad get() = 4 * dp
+    private val topPad get() = 5 * dp
     private val bottomPad get() = 6 * dp
     private val sidePad get() = 3 * dp
-    private val gapX get() = 3 * dp
-    private val gapY get() = 5 * dp
+    private val gapX get() = 5.5f * dp
+    private val gapY get() = 10 * dp
 
     private class Key(val spec: KeySpec, val rect: RectF, val box: KeyBox)
 
@@ -98,93 +128,154 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
         val w = MeasureSpec.getSize(widthMeasureSpec)
-        val rows = spec.rows.size
-        val h = (stripH + topPad + rows * keyH + bottomPad).toInt()
+        val h = (stripH + topPad + spec.rows.size * keyH + bottomPad).toInt()
         setMeasuredDimension(w, h)
     }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         layoutKeys()
+        emojiPane.layout(RectF(0f, stripH, w.toFloat(), h.toFloat()))
     }
 
     private fun layoutKeys() {
         if (width == 0) return
         val unit = (width - 2 * sidePad) / 10f
         val list = ArrayList<Key>()
+        val lastBottom = stripH + topPad + spec.rows.size * keyH
         spec.rows.forEachIndexed { r, row ->
             val top = stripH + topPad + r * keyH
             var x = 0f
             for (ks in row) {
-                val l = sidePad + x * unit
-                val rr = sidePad + (x + ks.width) * unit
-                // The touch box is the full cell (no gaps), the drawn key is inset.
-                val box = KeyBox(list.size, ks.letter, l, top, rr, top + keyH)
+                var l = sidePad + x * unit
+                var rr = sidePad + (x + ks.width) * unit
                 val rect = RectF(l + gapX / 2, top + gapY / 2, rr - gapX / 2, top + keyH - gapY / 2)
-                list.add(Key(ks, rect, box))
+                // The touch box is the full cell (no gaps), stretched to the screen edges.
+                if (x == 0f) l = 0f
+                if (abs(x + ks.width - 10f) < 0.01f) rr = width.toFloat()
+                val bottom = if (top + keyH >= lastBottom - 1) height.toFloat() else top + keyH
+                list.add(Key(ks, rect, KeyBox(list.size, ks.letter, l, top, rr, bottom)))
                 x += ks.width
             }
         }
-        // Stretch the outermost keys' touch boxes to the screen edges.
-        keys = list.map { k ->
-            val b = k.box
-            val l = if (b.left <= sidePad + 1) 0f else b.left
-            val r = if (b.right >= width - sidePad - 1) width.toFloat() else b.right
-            val btm = if (b.bottom >= stripH + topPad + spec.rows.size * keyH - 1) height.toFloat() else b.bottom
-            Key(k.spec, k.rect, KeyBox(b.index, b.letter, l, b.top, r, btm))
-        }
-        boxes = keys.map { it.box }
+        keys = list
+        boxes = list.map { it.box }
+        keyAnims.clear()
         if (showZones) computeZones()
     }
 
-    // ---------------------------------------------------------------- colours
+    // ---------------------------------------------------------------- colours & type
 
     private val dark = (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
         Configuration.UI_MODE_NIGHT_YES
 
-    private val cBg = if (dark) 0xFF1F1F21.toInt() else 0xFFD3D6DC.toInt()
-    private val cKey = if (dark) 0xFF5F5F62.toInt() else Color.WHITE
-    private val cSpecial = if (dark) 0xFF3A3A3D.toInt() else 0xFFABB0BA.toInt()
-    private val cPressed = if (dark) 0xFF838387.toInt() else 0xFFE6E8EC.toInt()
-    private val cShadow = if (dark) 0xFF0E0E0F.toInt() else 0xFF888B90.toInt()
+    private val cBg = if (dark) 0xFF1E1E20.toInt() else 0xFFD2D5DB.toInt()
+    private val cKey = if (dark) 0xFF5C5C5F.toInt() else Color.WHITE
+    private val cSpecial = if (dark) 0xFF38383B.toInt() else 0xFFA9AFB9.toInt()
+    private val cPressed = if (dark) 0xFF7E7E83.toInt() else 0xFFE3E5E9.toInt()
+    private val cSpecialPressed = if (dark) 0xFF5C5C5F.toInt() else Color.WHITE
+    private val cShadow = if (dark) 0xFF0B0B0C.toInt() else 0xFF878A90.toInt()
     private val cText = if (dark) Color.WHITE else Color.BLACK
-    private val cSub = if (dark) 0xFFB0B0B5.toInt() else 0xFF55585E.toInt()
+    private val cSub = if (dark) 0xFFA8A8AE.toInt() else 0xFF5E6168.toInt()
+    private val cEdge = if (dark) 0x14FFFFFF else 0x80FFFFFF.toInt()
     private val cAccent = 0xFF0A84FF.toInt()
+
+    private val regular = Typeface.DEFAULT
+    private val semibold: Typeface =
+        if (Build.VERSION.SDK_INT >= 28) Typeface.create(Typeface.DEFAULT, 600, false) else Typeface.DEFAULT_BOLD
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
     private val line = Paint(Paint.ANTI_ALIAS_FLAG)
 
+    private val emojiPane = EmojiPane(this, this).apply {
+        colors = EmojiPane.Colors(
+            bg = cBg, text = cText, sub = cSub, special = cSpecial,
+            pressed = if (dark) 0x40FFFFFF else 0x26000000,
+        )
+    }
+
+    // ---------------------------------------------------------------- springs
+
+    private val keyAnims = HashMap<Int, Spring>()          // press highlight per key
+    private val shiftAnim = Spring(0f, response = 0.18f)
+    private val trackpadAnim = Spring(0f, response = 0.25f)
+    private val popupAnim = Spring(0f, response = 0.2f)
+    private val popupSelAnim = Spring(0f, response = 0.12f)
+    private val stripAnims = Array(3) { Spring(0f, response = 0.2f) }
+    private val emojiAnim = Spring(0f, response = 0.32f)
+
+    private fun keyAnim(k: Key) = keyAnims.getOrPut(k.box.index) { Spring(0f, response = 0.18f) }
+
+    private var lastFrame = 0L
+
+    /** Steps every spring; keeps drawing frames only while something is moving. */
+    private fun stepAnimations(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        val dt = if (lastFrame == 0L) 0.016f else (now - lastFrame) / 1000f
+        lastFrame = now
+        var moving = false
+        for (s in keyAnims.values) moving = s.step(dt) || moving
+        moving = shiftAnim.step(dt) || moving
+        moving = trackpadAnim.step(dt) || moving
+        moving = popupAnim.step(dt) || moving
+        moving = popupSelAnim.step(dt) || moving
+        for (s in stripAnims) moving = s.step(dt) || moving
+        moving = emojiAnim.step(dt) || moving
+        moving = emojiPane.step(dt) || moving
+        if (!moving) lastFrame = 0L
+        return moving
+    }
+
     // ---------------------------------------------------------------- drawing
 
     override fun onDraw(canvas: Canvas) {
+        val moving = stepAnimations()
         canvas.drawColor(cBg)
+        // A faint bright top edge, like light catching the edge of a material.
+        line.color = cEdge
+        line.strokeWidth = 1f
+        canvas.drawLine(0f, 0.5f, width.toFloat(), 0.5f, line)
         drawStrip(canvas)
-        val radius = 6 * dp
-        for (k in keys) {
-            val pressed = pointers.values.any { it.key === k && it.mode != Mode.TRACKPAD }
-            val special = k.spec.type != KeyType.LETTER && k.spec.type != KeyType.CHAR && k.spec.type != KeyType.SPACE
-            var color = when {
-                pressed -> if (special) cKey else cPressed
-                special -> cSpecial
-                else -> cKey
-            }
-            var labelColor = cText
-            if (k.spec.type == KeyType.SHIFT && shift != ShiftState.OFF) {
-                color = Color.WHITE
-                labelColor = Color.BLACK
-            }
-            fill.color = cShadow
-            canvas.drawRoundRect(k.rect.left, k.rect.top + 1.2f * dp, k.rect.right, k.rect.bottom + 1.2f * dp, radius, radius, fill)
-            fill.color = color
-            canvas.drawRoundRect(k.rect, radius, radius, fill)
-            drawLabel(canvas, k, labelColor)
+
+        val e = emojiAnim.value.coerceIn(0f, 1f)
+        if (e < 0.999f) {
+            canvas.save()
+            canvas.translate(0f, e * 14 * dp)
+            drawKeys(canvas, 1f - e)
+            canvas.restore()
         }
-        if (trackpadActive()) {
-            fill.color = (cBg and 0x00FFFFFF) or 0xB0000000.toInt()
-            canvas.drawRect(0f, stripH, width.toFloat(), height.toFloat(), fill)
+        if (e > 0.001f) {
+            canvas.save()
+            canvas.translate(0f, (1f - e) * 28 * dp)
+            emojiPane.draw(canvas, e)
+            canvas.restore()
+        }
+        if (moving) postInvalidateOnAnimation()
+    }
+
+    private fun drawKeys(canvas: Canvas, alpha: Float) {
+        val radius = 6 * dp
+        val dim = trackpadAnim.value.coerceIn(0f, 1f)
+        for (k in keys) {
+            val special = k.spec.type !in setOf(KeyType.LETTER, KeyType.CHAR, KeyType.SPACE)
+            val press = keyAnims[k.box.index]?.value ?: 0f
+            var color = if (special) lerpColor(cSpecial, cSpecialPressed, press) else lerpColor(cKey, cPressed, press)
+            var labelColor = cText
+            if (k.spec.type == KeyType.SHIFT) {
+                val s = shiftAnim.value.coerceIn(0f, 1f)
+                color = lerpColor(color, Color.WHITE, s)
+                labelColor = lerpColor(cText, Color.BLACK, s)
+            }
+            // In trackpad mode the keys turn into a blank surface (labels fade out).
+            color = lerpColor(color, cSpecial, dim * 0.6f)
+            fill.color = withAlpha(cShadow, alpha * (1f - dim))
+            canvas.drawRoundRect(k.rect.left, k.rect.top + 1.2f * dp, k.rect.right, k.rect.bottom + 1.2f * dp, radius, radius, fill)
+            fill.color = withAlpha(color, alpha)
+            canvas.drawRoundRect(k.rect, radius, radius, fill)
+            drawLabel(canvas, k, withAlpha(labelColor, alpha * (1f - dim)))
         }
         zoneLines?.let {
-            line.color = cAccent
+            line.color = withAlpha(cAccent, alpha)
             line.strokeWidth = 1.5f * dp
             canvas.drawLines(it, line)
         }
@@ -207,36 +298,42 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private fun drawLabel(canvas: Canvas, k: Key, color: Int) {
         val l = label(k)
         text.color = color
-        text.typeface = Typeface.DEFAULT
+        text.typeface = regular
+        // Size-specific tracking: small labels a touch looser, large glyphs neutral.
+        text.letterSpacing = 0f
         text.textSize = when {
-            k.spec.type == KeyType.SPACE -> 15 * dp
-            l.length > 1 && k.spec.type != KeyType.ENTER -> 16 * dp
-            k.spec.type == KeyType.ENTER && l.length > 1 -> 15 * dp
+            k.spec.type == KeyType.EMOJI -> 22 * dp
+            k.spec.type == KeyType.SPACE -> { text.letterSpacing = 0.01f; 15 * dp }
+            l.length > 1 -> { text.letterSpacing = 0.01f; 15.5f * dp }
             k.spec.type == KeyType.LETTER -> 23 * dp
             else -> 21 * dp
         }
-        if (k.spec.type == KeyType.SPACE) text.color = cSub
+        if (k.spec.type == KeyType.SPACE) text.color = withAlpha(cSub, (color ushr 24) / 255f)
         val y = k.rect.centerY() - (text.descent() + text.ascent()) / 2
         canvas.drawText(l, k.rect.centerX(), y, text)
+        text.letterSpacing = 0f
     }
 
     private fun drawStrip(canvas: Canvas) {
         val w = width / 3f
-        line.color = cSub
+        line.color = withAlpha(cSub, 0.35f)
         line.strokeWidth = 1f * dp
-        for (i in 1..2) canvas.drawLine(i * w, stripH * 0.28f, i * w, stripH * 0.72f, line)
+        for (i in 1..2) canvas.drawLine(i * w, stripH * 0.3f, i * w, stripH * 0.7f, line)
         for (i in 0..2) {
             var s = slots.getOrElse(i) { "" }
+            val press = stripAnims[i].value
+            if (press > 0.01f) {
+                fill.color = withAlpha(cSpecial, press)
+                canvas.drawRoundRect(i * w + 4 * dp, 5 * dp, (i + 1) * w - 4 * dp, stripH - 5 * dp, 9 * dp, 9 * dp, fill)
+            }
             if (s.isEmpty()) continue
+            val emoji = TextUtil.isEmoji(s)
             if (i == quoteSlot) s = "«$s»"
             text.color = cText
-            text.textSize = 17 * dp
-            text.typeface = if (i == boldSlot) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            text.textSize = if (emoji) 22 * dp else 17 * dp
+            text.typeface = if (i == boldSlot && !emoji) semibold else regular
+            text.letterSpacing = 0f
             s = ellipsize(s, w - 12 * dp)
-            if (i == stripPressed) {
-                fill.color = cSpecial
-                canvas.drawRoundRect(i * w + 4 * dp, 4 * dp, (i + 1) * w - 4 * dp, stripH - 4 * dp, 8 * dp, 8 * dp, fill)
-            }
             canvas.drawText(s, i * w + w / 2, stripH / 2 - (text.descent() + text.ascent()) / 2, text)
         }
     }
@@ -250,48 +347,56 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
 
     private fun drawPreview(canvas: Canvas, k: Key) {
         val w = k.rect.width() * 1.35f
-        val h = k.rect.height() * 1.15f
+        val h = k.rect.height() * 1.25f
         val cx = k.rect.centerX().coerceIn(w / 2, width - w / 2)
-        val bottom = k.rect.top + k.rect.height() * 0.15f
+        val bottom = k.rect.top + k.rect.height() * 0.1f
         val r = RectF(cx - w / 2, max(0f, bottom - h), cx + w / 2, bottom)
         fill.color = cShadow
-        canvas.drawRoundRect(r.left, r.top + 1.5f * dp, r.right, r.bottom + 1.5f * dp, 8 * dp, 8 * dp, fill)
+        canvas.drawRoundRect(r.left, r.top + 1.5f * dp, r.right, r.bottom + 1.5f * dp, 9 * dp, 9 * dp, fill)
         fill.color = cKey
-        canvas.drawRoundRect(r, 8 * dp, 8 * dp, fill)
+        canvas.drawRoundRect(r, 9 * dp, 9 * dp, fill)
         text.color = cText
-        text.typeface = Typeface.DEFAULT
-        text.textSize = 30 * dp
+        text.typeface = regular
+        text.textSize = 32 * dp
+        text.letterSpacing = -0.02f // large glyph: slightly tighter
         canvas.drawText(label(k), r.centerX(), r.centerY() - (text.descent() + text.ascent()) / 2, text)
+        text.letterSpacing = 0f
     }
 
     private fun popupRect(p: Pointer): RectF {
         val n = p.key.spec.variants.size
-        val cell = p.key.rect.width() * 1.05f
+        val cell = p.key.rect.width() * 1.1f
         val w = cell * n
         val left = (p.key.rect.left).coerceIn(2 * dp, max(2 * dp, width - w - 2 * dp))
         val bottom = p.key.rect.top + p.key.rect.height() * 0.1f
-        return RectF(left, max(0f, bottom - keyH * 0.95f), left + w, bottom)
+        return RectF(left, max(0f, bottom - keyH), left + w, bottom)
     }
 
     private fun drawPopup(canvas: Canvas, p: Pointer) {
         val r = popupRect(p)
-        fill.color = cShadow
-        canvas.drawRoundRect(r.left, r.top + 1.5f * dp, r.right, r.bottom + 1.5f * dp, 8 * dp, 8 * dp, fill)
-        fill.color = cKey
-        canvas.drawRoundRect(r, 8 * dp, 8 * dp, fill)
+        val s = popupAnim.value.coerceIn(0f, 1.2f)
+        canvas.save()
+        // Grows out of the key that was pressed (anchored at its top centre).
+        canvas.scale(0.6f + 0.4f * s, 0.6f + 0.4f * s, p.key.rect.centerX().coerceIn(r.left, r.right), r.bottom)
+        val a = s.coerceIn(0f, 1f)
+        fill.color = withAlpha(cShadow, a)
+        canvas.drawRoundRect(r.left, r.top + 1.5f * dp, r.right, r.bottom + 1.5f * dp, 9 * dp, 9 * dp, fill)
+        fill.color = withAlpha(cKey, a)
+        canvas.drawRoundRect(r, 9 * dp, 9 * dp, fill)
         val vs = p.key.spec.variants
         val cell = r.width() / vs.size
+        // Selection pill slides between options instead of jumping.
+        val sx = r.left + popupSelAnim.value * cell
+        fill.color = withAlpha(cAccent, a)
+        canvas.drawRoundRect(sx + 2 * dp, r.top + 2 * dp, sx + cell - 2 * dp, r.bottom - 2 * dp, 7 * dp, 7 * dp, fill)
         for ((i, v) in vs.withIndex()) {
-            val cr = RectF(r.left + i * cell, r.top, r.left + (i + 1) * cell, r.bottom)
-            if (i == p.popupIndex) {
-                fill.color = cAccent
-                canvas.drawRoundRect(cr.left + 2 * dp, cr.top + 2 * dp, cr.right - 2 * dp, cr.bottom - 2 * dp, 6 * dp, 6 * dp, fill)
-            }
-            text.color = if (i == p.popupIndex) Color.WHITE else cText
-            text.typeface = Typeface.DEFAULT
+            val cx = r.left + (i + 0.5f) * cell
+            text.color = withAlpha(if (i == p.popupIndex) Color.WHITE else cText, a)
+            text.typeface = regular
             text.textSize = 24 * dp
-            canvas.drawText(caseOf(v), cr.centerX(), cr.centerY() - (text.descent() + text.ascent()) / 2, text)
+            canvas.drawText(caseOf(v), cx, r.centerY() - (text.descent() + text.ascent()) / 2, text)
         }
+        canvas.restore()
     }
 
     // ---------------------------------------------------------------- touch-zone overlay
@@ -352,13 +457,19 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private val pointers = LinkedHashMap<Int, Pointer>()
     private var stripPressed = -1
     private var stripPointer = -1
-
-    private fun trackpadActive() = pointers.values.any { it.mode == Mode.TRACKPAD }
+    private var emojiTouch = false
 
     private fun caseOf(s: String) = if (shift != ShiftState.OFF) s.uppercase() else s
 
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        // The emoji panel owns the area below the strip while it's (becoming) visible.
+        if (e.actionMasked == MotionEvent.ACTION_DOWN) emojiTouch = emojiVisible && e.y >= stripH
+        if (emojiTouch) {
+            emojiPane.onTouch(e)
+            invalidate()
+            return true
+        }
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = e.actionIndex
@@ -369,14 +480,22 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 val i = e.actionIndex
                 up(e.getPointerId(i), e.getX(i), e.getY(i))
             }
-            MotionEvent.ACTION_CANCEL -> {
-                for (p in pointers.values) cancelCallbacks(p)
-                pointers.clear()
-                stripPressed = -1
-                invalidate()
-            }
+            MotionEvent.ACTION_CANCEL -> cancelAllPointers()
         }
         return true
+    }
+
+    private fun cancelAllPointers() {
+        for (p in pointers.values) {
+            cancelCallbacks(p)
+            keyAnim(p.key).animateTo(0f)
+        }
+        pointers.clear()
+        if (stripPressed >= 0) stripAnims[stripPressed].animateTo(0f)
+        stripPressed = -1
+        stripPointer = -1
+        trackpadAnim.animateTo(0f)
+        invalidate()
     }
 
     private fun down(id: Int, x: Float, y: Float) {
@@ -385,10 +504,12 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 stripPointer = id
                 stripPressed = (x / (width / 3f)).toInt().coerceIn(0, 2)
                 if (slots.getOrElse(stripPressed) { "" }.isEmpty()) stripPressed = -1
+                else stripAnims[stripPressed].snap(1f) // instant feedback on touch-down
                 invalidate()
             }
             return
         }
+        if (emojiVisible) return
         // Fast typists press the next key before releasing the previous one:
         // commit pending taps first so the prediction sees the right letters.
         for (p in pointers.values) if (p.mode == Mode.NORMAL && p.key.spec.type != KeyType.SPACE &&
@@ -396,12 +517,14 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             cancelCallbacks(p)
             commit(p)
             p.mode = Mode.DONE
+            keyAnim(p.key).animateTo(0f)
         }
         val p0 = if (spec === Layouts.LETTERS) prior else null
         val box = touchModel.resolve(x, y, boxes, p0) ?: return
         val key = keys[box.index]
         val p = Pointer(id, key, x, y)
         pointers[id] = p
+        keyAnim(key).snap(1f) // highlight + haptic on the same frame as the touch
         feedback(key)
         when (key.spec.type) {
             KeyType.DELETE -> {
@@ -417,42 +540,63 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
     private fun onLongPress(p: Pointer) {
         if (!pointers.containsValue(p) || p.mode != Mode.NORMAL) return
         if (p.key.spec.type == KeyType.SPACE) {
-            p.mode = Mode.TRACKPAD
+            enterTrackpad(p, p.x)
         } else {
             p.mode = Mode.POPUP
             p.popupIndex = 0
+            popupAnim.snap(0f)
+            popupAnim.animateTo(1f)
+            popupSelAnim.snap(0f)
         }
         if (haptics) performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         invalidate()
     }
 
+    private fun enterTrackpad(p: Pointer, x: Float) {
+        p.mode = Mode.TRACKPAD
+        p.lastTrackX = x
+        trackpadAnim.animateTo(1f)
+        keyAnim(p.key).animateTo(0f)
+    }
+
     private fun move(id: Int, x: Float, y: Float) {
-        if (id == stripPointer && stripPressed >= 0) {
-            val s = (x / (width / 3f)).toInt().coerceIn(0, 2)
-            if (s != stripPressed || y > stripH * 1.5f) { stripPressed = -1; invalidate() }
+        if (id == stripPointer) {
+            if (stripPressed >= 0) {
+                val s = (x / (width / 3f)).toInt().coerceIn(0, 2)
+                if (s != stripPressed || y > stripH * 1.5f) {
+                    stripAnims[stripPressed].animateTo(0f) // dragged away = cancel
+                    stripPressed = -1
+                    invalidate()
+                }
+            }
             return
         }
         val p = pointers[id] ?: return
         when (p.mode) {
-            Mode.NORMAL -> if (p.key.spec.type == KeyType.SPACE && abs(x - p.x) > 14 * dp) {
+            Mode.NORMAL -> if (p.key.spec.type == KeyType.SPACE && abs(x - p.x) > 12 * dp) {
                 // Slide on the space bar = move the cursor (like iOS' trackpad).
                 removeCallbacks(p.longPress)
-                p.mode = Mode.TRACKPAD
-                p.lastTrackX = x
+                enterTrackpad(p, x)
                 invalidate()
             }
             Mode.POPUP -> {
                 val r = popupRect(p)
                 val n = p.key.spec.variants.size
                 val idx = ((x - r.left) / (r.width() / n)).toInt().coerceIn(0, n - 1)
-                if (idx != p.popupIndex) { p.popupIndex = idx; invalidate() }
+                if (idx != p.popupIndex) {
+                    p.popupIndex = idx
+                    popupSelAnim.animateTo(idx.toFloat())
+                    if (haptics) performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    invalidate()
+                }
             }
             Mode.TRACKPAD -> {
-                val stepPx = 11 * dp
+                val stepPx = 10 * dp
                 val steps = ((x - p.lastTrackX) / stepPx).toInt()
                 if (steps != 0) {
                     p.lastTrackX += steps * stepPx
                     listener.onCursorMove(steps)
+                    if (haptics) performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                 }
             }
             Mode.DONE -> {}
@@ -464,13 +608,18 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             val s = stripPressed
             stripPointer = -1
             stripPressed = -1
-            if (s >= 0 && y < stripH * 1.5f) listener.onSuggestion(s)
+            if (s >= 0) {
+                stripAnims[s].animateTo(0f)
+                if (y < stripH * 1.5f) listener.onSuggestion(s)
+            }
             invalidate()
             return
         }
         val p = pointers.remove(id) ?: return
         cancelCallbacks(p)
+        if (p.mode == Mode.TRACKPAD) trackpadAnim.animateTo(0f)
         if (p.mode != Mode.DONE) commit(p)
+        keyAnim(p.key).animateTo(0f) // highlight fades out; it appeared instantly
         invalidate()
     }
 
@@ -493,7 +642,7 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
                 KeyType.ENTER -> listener.onEnter()
                 KeyType.SHIFT -> listener.onShift()
                 KeyType.DELETE -> {}
-                KeyType.TO_SYMBOLS, KeyType.TO_SYMBOLS2, KeyType.TO_LETTERS -> listener.onMode(s.type)
+                KeyType.EMOJI, KeyType.TO_SYMBOLS, KeyType.TO_SYMBOLS2, KeyType.TO_LETTERS -> listener.onMode(s.type)
             }
             else -> {}
         }
@@ -513,4 +662,10 @@ class KeyboardView(context: Context, private val listener: Listener) : View(cont
             audio.playSoundEffect(fx, -1f)
         }
     }
+
+    // ---------------------------------------------------------------- EmojiPane.Listener
+
+    override fun onEmoji(emoji: String) = listener.onEmoji(emoji)
+    override fun onDelete(repeat: Int) = listener.onDelete(repeat)
+    override fun onCloseEmoji() = listener.onMode(KeyType.TO_LETTERS)
 }

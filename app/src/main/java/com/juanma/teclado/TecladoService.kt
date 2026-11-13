@@ -35,7 +35,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
 
     // ---- input state
     private class Touch(val box: KeyBox, val x: Float, val y: Float)
-    private class AutoFix(val typed: String, val corrected: String, var sep: String = "")
+    private class AutoFix(val typed: String, val corrected: String, val context: List<String>, var sep: String = "")
     private class CursorWord(val start: Int, val end: Int, val word: String)
 
     private val composing = StringBuilder()
@@ -71,7 +71,11 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         io.execute {
             val m = LanguageModel()
             assets.open("dict_es.txt").bufferedReader().useLines { m.loadBase(it) }
-            m.importUser(store.read(store.words).lineSequence(), store.read(store.bigrams).lineSequence())
+            m.importUser(
+                store.read(store.words).lineSequence(),
+                store.read(store.order).lineSequence(),
+                store.read(store.emoji).lineSequence(),
+            )
             val offsets = store.read(store.offsets)
             handler.post {
                 lm = m
@@ -141,6 +145,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         composing.clear(); touches.clear()
         lastAuto = null; autoSpace = false; cursorWord = null
         selStart = info.initialSelStart; selEnd = info.initialSelEnd
+        view?.emojiVisible = false
         shift = ShiftState.OFF
         updateShift()
         detectCursorWord()
@@ -166,11 +171,13 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         val offsets = touchModel.exportOffsets()
         if (!m.dirty) { io.execute { store.write(store.offsets, offsets) }; return }
         val w = m.exportUserWords()
-        val b = m.exportBigrams()
+        val o = m.exportOrder()
+        val e = m.exportEmoji()
         m.markSaved()
         io.execute {
             store.write(store.words, w)
-            store.write(store.bigrams, b)
+            store.write(store.order, o)
+            store.write(store.emoji, e)
             store.write(store.offsets, offsets)
         }
     }
@@ -189,16 +196,20 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
 
     // ------------------------------------------------------------------ helpers
 
-    /** The word before the one being typed (for bigram prediction), or null. */
-    private fun prevWord(): String? {
-        val before = ic?.getTextBeforeCursor(64, 0)?.toString() ?: return null
+    /**
+     * The previous one or two words of the current sentence (for word-order learning
+     * and prediction), excluding the word being typed / under the cursor.
+     */
+    private fun context(): List<String> {
+        val before = ic?.getTextBeforeCursor(CONTEXT_WINDOW, 0)?.toString() ?: return emptyList()
+        val complete = before.length < CONTEXT_WINDOW
         val cut = when {
             composing.isNotEmpty() -> composing.length
             cursorWord != null -> (selStart - cursorWord!!.start).coerceAtLeast(0)
             else -> 0
         }
-        if (cut > before.length) return null
-        return TextUtil.lastWord(before.substring(0, before.length - cut))
+        if (cut > before.length) return emptyList()
+        return TextUtil.contextWords(before.substring(0, before.length - cut), complete)
     }
 
     private fun sentenceStart(): Boolean {
@@ -229,7 +240,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
             v.prior = null
             return
         }
-        val prev = prevWord()
+        val prev = context()
         var bold = -1
         var quote = -1
         val cw = cursorWord
@@ -251,12 +262,13 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         }
         v.setSuggestions(slots, bold, quote)
 
+        v.recentEmojis = m.recentEmojis(24)
         val prefix = when {
             composing.isNotEmpty() -> composing.toString()
             cw != null && selStart == cw.end -> cw.word
             else -> ""
         }
-        v.prior = if (touchModel.enabled) m.nextLetterDistribution(prefix, letters) else null
+        v.prior = if (touchModel.enabled) m.nextLetterDistribution(prefix, letters, prev) else null
     }
 
     /** Looks at the text around the cursor and remembers the word it's touching. */
@@ -316,7 +328,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         if (composing.isEmpty()) return
         val i = ic ?: return
         val typed = composing.toString()
-        val prev = prevWord()
+        val prev = context()
         val m = lm
         val sug = suggester
         val final = if (autocorrect && autocorrectOn && sug != null) {
@@ -324,7 +336,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         } else typed
         i.commitText(final, 1)
         if (final != typed) {
-            lastAuto = AutoFix(typed, final)
+            lastAuto = AutoFix(typed, final, prev)
         } else {
             lastAuto = null
             // The word was typed right: use the touches to learn where this person aims.
@@ -435,7 +447,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
                 i.deleteSurroundingText(expected.length, 0)
                 i.commitText(fix.typed + fix.sep, 1)
                 i.endBatchEdit()
-                if (learnOn) lm?.learn(prevWord(), fix.typed, force = true)
+                if (learnOn) lm?.learn(fix.context, fix.typed, force = true)
                 refresh()
                 return
             }
@@ -495,6 +507,12 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
     }
 
     override fun onMode(type: KeyType) {
+        if (type == KeyType.EMOJI) {
+            view?.recentEmojis = lm?.recentEmojis(24) ?: emptyList()
+            view?.emojiVisible = true
+            return
+        }
+        view?.emojiVisible = false
         spec = when (type) {
             KeyType.TO_SYMBOLS -> Layouts.SYMBOLS
             KeyType.TO_SYMBOLS2 -> Layouts.SYMBOLS2
@@ -503,15 +521,42 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
         refresh()
     }
 
+    override fun onEmoji(emoji: String) {
+        val i = ic ?: return
+        commitComposing(autocorrect = true)
+        insertEmoji(i, emoji)
+    }
+
+    /** Inserts [emoji] and remembers which words it came after. */
+    private fun insertEmoji(i: InputConnection, emoji: String) {
+        val ctx = context()
+        i.commitText(emoji, 1)
+        if (learnOn) lm?.learnEmoji(ctx, emoji)
+        lastAuto = null
+        autoSpace = false
+        cursorWord = null
+        updateShift()
+        refresh()
+    }
+
     override fun onSuggestion(index: Int) {
         val i = ic ?: return
         val word = slots.getOrNull(index)?.takeIf { it.isNotEmpty() } ?: return
         val m = lm
         val cw = cursorWord
+        if (TextUtil.isEmoji(word)) {
+            // Emoji suggestion: keep the word, then add the emoji after it.
+            if (composing.isNotEmpty()) {
+                commitComposing(autocorrect = true)
+                i.commitText(" ", 1)
+            }
+            insertEmoji(i, word)
+            return
+        }
         when {
             composing.isNotEmpty() -> {
                 val typed = composing.toString()
-                val prev = prevWord()
+                val prev = context()
                 i.commitText(word, 1)
                 // Picking the literal word means "this is a real word": learn it now.
                 if (learnOn) m?.learn(prev, word, force = word == typed)
@@ -521,7 +566,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
             }
             cw != null -> {
                 // Replace the word the cursor is on (correction of an existing word).
-                val prev = prevWord()
+                val prev = context()
                 i.beginBatchEdit()
                 i.finishComposingText()
                 i.setComposingRegion(cw.start, cw.end)
@@ -531,7 +576,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
                 autoSpace = false
             }
             else -> {
-                val prev = prevWord()
+                val prev = context()
                 i.commitText("$word ", 1)
                 if (learnOn) m?.learn(prev, word)
                 autoSpace = true
@@ -557,6 +602,7 @@ class TecladoService : InputMethodService(), KeyboardView.Listener {
 
     companion object {
         private const val WORD_DELETE_AFTER = 14
+        private const val CONTEXT_WINDOW = 160
         private val PUNCTUATION = setOf(".", ",", ";", ":", "!", "?", "…")
         private val CLOSERS = setOf(")", "]", "}", "\"", "'", "»")
     }

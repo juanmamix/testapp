@@ -35,7 +35,8 @@ class Prefs(context: Context) {
 class UserStore(context: Context) {
     private val dir = context.filesDir
     val words = File(dir, "user_words.tsv")
-    val bigrams = File(dir, "user_bigrams.tsv")
+    val order = File(dir, "user_order.tsv")
+    val emoji = File(dir, "user_emoji.tsv")
     val offsets = File(dir, "touch_offsets.tsv")
 
     fun read(f: File): String = if (f.exists()) f.readText() else ""
@@ -47,6 +48,6 @@ class UserStore(context: Context) {
     }
 
     fun clear() {
-        words.delete(); bigrams.delete(); offsets.delete()
+        words.delete(); order.delete(); emoji.delete(); offsets.delete()
     }
 }
